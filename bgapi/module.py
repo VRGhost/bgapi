@@ -15,7 +15,7 @@ from .api import BlueGigaAPI, BlueGigaCallbacks
 from .cmd_def import gap_discoverable_mode, gap_connectable_mode, gap_discover_mode, \
     connection_status_mask, sm_io_capability, RESULT_CODE
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("bgapi")
 
 GET_ADDRESS = "Read Address in Progress"
 PROCEDURE = "Procedure in Progress"
