@@ -21,7 +21,7 @@ def hexlify_nice(data):
 
 class BlueGigaAPI(object):
     def __init__(self, port, callbacks=None, baud=115200, timeout=1):
-        self._serial = serial.Serial(port=port, baudrate=baud, timeout=timeout)
+        self._serial = self._openSerial(port, baud, timeout)
         self._serial.flushInput()
         self._serial.flushOutput()
         self.rx_buffer = b''
@@ -31,6 +31,13 @@ class BlueGigaAPI(object):
             self._callbacks = BlueGigaCallbacks()
         else:
             self._callbacks = callbacks
+
+    def _openSerial(self, port, baud, timeout):
+        ser = serial.Serial(port=port, baudrate=baud, timeout=timeout)
+        if ser.isOpen():
+            ser.close()
+        ser.open()
+        return ser
 
     def _run(self):
         self.rx_buffer = b''

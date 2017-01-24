@@ -9,7 +9,7 @@ import operator
 from functools import wraps
 from contextlib import contextmanager
 from collections import defaultdict, namedtuple, deque
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 
 from .api import BlueGigaAPI, BlueGigaCallbacks
 from .cmd_def import gap_discoverable_mode, gap_connectable_mode, gap_discover_mode, \
@@ -192,30 +192,77 @@ class GATTCharacteristic(object):
         else:
             return self.descriptors[uuid]
 
+class DelayedCaller(Thread):
+    """Delayed procedure calling thread."""
+
+    def __init__(self):
+        super(DelayedCaller, self).__init__()
+        self.daemon = True
+        self.call_stack = [] # (time_to_call_at, fn)
+        self.wakeup_event = Event()
+        self.mutex = Lock()
+        self.start()
+
+    def run(self):
+        while True:
+            with self.mutex:
+                if self.call_stack:
+                    now = time.time()
+                    next_call_in = min(el[0] - now for el in self.call_stack)
+                else:
+                    next_call_in = None # Wait for wakeup_event indefinetly
+            self.wakeup_event.wait(next_call_in)
+            # Waked up - call all scheduled functions (if any)
+            with self.mutex:
+                self.wakeup_event.clear()
+                now = time.time()
+                to_call = [el for el in self.call_stack if now > el[0]]
+                for el in to_call:
+                    self.call_stack.remove(el)
+                    try:
+                        el[1]() # Call the function
+                    except:
+                        logger.exception("Delayed call exception")
+
+    def scheduleCall(self, fn, delay):
+        with self.mutex:
+            assert callable(fn), fn
+            self.call_stack.append((time.time() + delay, fn))
+            self.wakeup_event.set()
+
 
 class ProcedureCallHandle(object):
 
-    __slots__ = ("event", "result")
+    __slots__ = ("event", "result", "payload", "delayed_caller")
 
-    def __init__(self):
+    def __init__(self, delayed_caller):
         self.event = Event()
+        self.payload = {}
+        self.delayed_caller = delayed_caller
 
     def setResult(self, result):
         self.result = result
         self.event.set()
+
+    def delayedSetResult(self, result, delay):
+        self.delayed_caller.scheduleCall(
+            lambda: self.setResult(result),
+            delay=delay,
+        )
 
 class ProcedureManager(object):
     def __init__(self):
         self._typeLocks = defaultdict(Lock) # procedure type -> execution lock for that
         self._handles = {} # procedure type -> <ProcedureCallHandle>
         self.ioTimestamps = defaultdict(lambda: deque([0], maxlen=4)) # procedure type -> time.time() of the last I/Os to the device
+        self._delayedProcedureCaller = DelayedCaller()
         
     @contextmanager
-    def procedure_call(self, procedure_type, timeout, throwError=True):
+    def procedure_call(self, procedure_type, timeout, throwError=True, payload=None):
         with self._typeLocks[procedure_type]:
             assert procedure_type not in self._handles # Nobody else is waiting for this procedure type
             
-            handle = ProcedureCallHandle()
+            handle = ProcedureCallHandle(self._delayedProcedureCaller)
             self._handles[procedure_type] = handle
 
             # Ensure that the lib does not exceed connection interval.
@@ -239,15 +286,19 @@ class ProcedureManager(object):
             finally:
                 del self._handles[procedure_type]
 
-
-    def procedure_complete(self, procedure_type, result=0x0000):
+    def procedure_complete(self, procedure_type, result=0x0000, payload=None, delay=None):
         self.ioTimestamps[procedure_type].append(time.time())
         try:
             handle = self._handles[procedure_type]
         except KeyError:
-            # This procedure had not been started, ignore the result
+            # This procedure has not been started, ignore the result
             return
-        handle.setResult(result)
+        if payload:
+            handle.payload.update(payload)
+        if delay:
+            handle.delayedSetResult(result, delay)
+        else:
+            handle.setResult(result)
 
     def get_active_procedure_calls(self):
         return tuple(self._handles.keys())
@@ -547,8 +598,7 @@ class BlueGigaModule(BlueGigaCallbacks, ProcedureManager):
                                           address_type=address_type, interval=conn_interval, timeout=timeout,
                                           latency=latency, bonding=bonding)
             self.connections[connection] = conn
-            self.most_recent_connection = conn
-            self.procedure_complete(CONNECT)
+            self.procedure_complete(CONNECT, payload={"connection_object": conn})
         if flags & connection_status_mask['connection_parameters_change']:
             self.connections[connection].flags = flags
             self.connections[connection].interval = conn_interval
@@ -580,9 +630,17 @@ class BlueGigaModule(BlueGigaCallbacks, ProcedureManager):
 
     def ble_rsp_gap_connect_direct(self, result, connection_handle):
         super(BlueGigaModule, self).ble_rsp_gap_connect_direct(result, connection_handle)
-        if result and connection_handle in self.connections:
-            self.connections[connection_handle].set_disconnected(result)
+        if result:
+            # Connect direct error
+            if connection_handle in self.connections:
+                self.connections[connection_handle].set_disconnected(result)
             self.procedure_complete(CONNECT, result=result)
+        else:
+            self.procedure_complete(CONNECT,
+                result=result,
+                payload={"connection_handle": connection_handle},
+                delay=2
+            ) # Give device 2 seconds to send connection_status
 
 class BlueGigaClient(BlueGigaModule):
     def connect_by_adv_data(self, adv_data, scan_timeout=3, conn_interval_min=0x20, conn_interval_max=0x30, connection_timeout=100, latency=0):
@@ -609,7 +667,13 @@ class BlueGigaClient(BlueGigaModule):
         return self._api.ble_cmd_gap_set_scan_parameters(scan_interval, scan_window, 0)
 
     def connect(self, target, timeout=5, conn_interval_min=0x20, conn_interval_max=0x30, connection_timeout=100, latency=0):
-        with self.procedure_call(CONNECT, timeout):
+        prevDeviceConn = None
+        for oldConnection in self.connections.values():
+            if oldConnection.address == target.sender:
+                prevDeviceConn = oldConnection
+                break
+
+        with self.procedure_call(CONNECT, timeout) as call_handle:
             self._api.ble_cmd_gap_connect_direct(
                 address=target.sender,
                 addr_type=target.address_type,
@@ -618,7 +682,26 @@ class BlueGigaClient(BlueGigaModule):
                 timeout=connection_timeout,
                 latency=latency
             )
-        return self.most_recent_connection
+
+        # Decide what connection object to return
+        try:
+            rv = call_handle.payload["connection_object"]
+        except KeyError:
+            # A second connection to a previously existing device?
+            if prevDeviceConn:
+                rv = self.CONNECTION_OBJECT(
+                    api=self._api,
+                    handle=call_handle.payload["connection_handle"],
+                    address=target.sender, address_type=target.address_type,
+                    interval=prevDeviceConn.interval,
+                    timeout=prevDeviceConn.timeout,
+                    latency=prevDeviceConn.latency,
+                    bonding=prevDeviceConn.bond_handle
+                )
+                self.connections[rv.handle] = rv
+            else:
+                raise Exception("Unexpected `connect` behaviour")
+        return rv
 
     def _scan(self, mode, timeout):
         self.scan_responses = None
