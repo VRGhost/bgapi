@@ -19,6 +19,9 @@ def hexlify_nice(data):
     else:
         return ' '.join([ '%02X' % ord(b) for b in data ])
 
+class PacketFormatError(Exception):
+    """This exception is raised when packet data read from serial is incorrect."""
+
 class BlueGigaAPI(object):
     def __init__(self, port, callbacks=None, baud=115200, timeout=1):
         self._serial = self._openSerial(port, baud, timeout)
@@ -49,15 +52,27 @@ class BlueGigaAPI(object):
         self.rx_buffer += self._serial.read(min(self._packet_size - len(self.rx_buffer), max_read_len))
         while len(self.rx_buffer) >= self._packet_size:
             self._packet_size = 4 + (struct.unpack('>H', self.rx_buffer[:2])[0] & 0x7FF)
+
+            if self._packet_size > MAX_BGAPI_PACKET_SIZE:
+                # Skip a byte from buffer
+                self.rx_buffer = self.rx_buffer[1:]
+                continue
+                
             if len(self.rx_buffer) < self._packet_size:
                 break
-            packet, self.rx_buffer = self.rx_buffer[:self._packet_size], self.rx_buffer[self._packet_size:]
-            self._packet_size = 4
-            
+            packet = self.rx_buffer[:self._packet_size]
+
             try:
                 self.parse_bgapi_packet(packet)
-            except Exception:
+            except PacketFormatError:
                 logger.exception("Error parsing bgapi packet.")
+                # Skip a byte from buffer
+                self.rx_buffer = self.rx_buffer[1:]
+            except Exception:
+                logger.exception("Error processing bgapi packet.")
+            else:
+                # No exception
+                self.rx_buffer = self.rx_buffer[self._packet_size:]
 
     def start_daemon(self):
         """
@@ -266,13 +281,22 @@ class BlueGigaAPI(object):
 
     def parse_bgapi_packet(self, packet, callbacks=None):
         logger.debug('<=[ ' + hexlify_nice(packet) + ' ]')
-        payload_length, packet_class, packet_command = struct.unpack('>HBB', packet[:4])
-        message_type = payload_length >> 15
-        technology_type = (payload_length >> 11) & 0xf
+        (
+            header,
+            payload_length_low,
+            packet_class,
+            packet_command,
+        )   = struct.unpack('>BBBB', packet[:4])
+        message_type = header >> 7
+        technology_type = (header >> 3) & 0xF
+        payload_length = ((header & 7) << 8) | payload_length_low
+
         # payload_length &= 0x7ff
         rx_payload = packet[4:]
-        if technology_type:
-            raise ValueError("Unsupported techlogy type: 0x%02x" % technology_type)
+        if technology_type != 0:
+            # Technology type '0' - Bluetooth
+            #   '1' - Wifi
+            raise PacketFormatError("Unsupported techlogy type: 0x%02x" % technology_type)
         if message_type == 0:
             # 0x00 = BLE response packet
             self.parse_bgapi_response(packet_class, packet_command, rx_payload, callbacks)
