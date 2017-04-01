@@ -57,7 +57,7 @@ class BlueGigaAPI(object):
                 # Skip a byte from buffer
                 self.rx_buffer = self.rx_buffer[1:]
                 continue
-                
+
             if len(self.rx_buffer) < self._packet_size:
                 break
             packet = self.rx_buffer[:self._packet_size]
@@ -70,6 +70,7 @@ class BlueGigaAPI(object):
                 self.rx_buffer = self.rx_buffer[1:]
             except Exception:
                 logger.exception("Error processing bgapi packet.")
+                self.rx_buffer = self.rx_buffer[1:]
             else:
                 # No exception
                 self.rx_buffer = self.rx_buffer[self._packet_size:]
